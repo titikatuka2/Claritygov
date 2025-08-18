@@ -12,14 +12,22 @@
 (define-constant ERR_ALLOCATION_NOT_FOUND (err u110))
 (define-constant ERR_ALLOCATION_ALREADY_WITHDRAWN (err u111))
 (define-constant ERR_NOT_ALLOCATION_RECIPIENT (err u112))
+(define-constant ERR_AMENDMENT_NOT_FOUND (err u113))
+(define-constant ERR_AMENDMENT_ALREADY_VOTED (err u114))
+(define-constant ERR_AMENDMENT_VOTING_ENDED (err u115))
+(define-constant ERR_AMENDMENT_NOT_ACTIVE (err u116))
+(define-constant ERR_NOT_ORIGINAL_PROPOSER (err u117))
+(define-constant ERR_CANNOT_AMEND_FINALIZED_PROPOSAL (err u118))
 (define-constant MIN_VOTING_PERIOD u144)
 (define-constant MAX_VOTING_PERIOD u4320)
+(define-constant MIN_AMENDMENT_SUPPORT u51)
 
 (define-data-var proposal-counter uint u0)
 (define-data-var min-quorum uint u100)
 (define-data-var treasury-balance uint u0)
 (define-data-var treasury-proposal-counter uint u0)
 (define-data-var allocation-counter uint u0)
+(define-data-var amendment-counter uint u0)
 
 (define-map proposals
   uint
@@ -81,6 +89,36 @@
     allocated-block: uint,
     withdrawn: bool
   }
+)
+
+(define-map proposal-amendments
+  uint
+  {
+    proposal-id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    proposer: principal,
+    amendment-type: (string-ascii 50),
+    new-title: (optional (string-ascii 100)),
+    new-description: (optional (string-ascii 500)),
+    new-category: (optional (string-ascii 50)),
+    start-block: uint,
+    end-block: uint,
+    votes-for: uint,
+    votes-against: uint,
+    status: (string-ascii 20),
+    required-support: uint
+  }
+)
+
+(define-map amendment-votes
+  { amendment-id: uint, voter: principal }
+  { vote: bool, voting-power: uint }
+)
+
+(define-map proposal-amendment-history
+  uint
+  (list 10 uint)
 )
 
 (define-public (register-voter)
@@ -169,6 +207,131 @@
       (map-set proposals proposal-id (merge proposal { status: new-status }))
       (ok new-status)
     )
+  )
+)
+
+(define-public (create-proposal-amendment (proposal-id uint) (title (string-ascii 100)) (description (string-ascii 500)) (amendment-type (string-ascii 50)) (new-title (optional (string-ascii 100))) (new-description (optional (string-ascii 500))) (new-category (optional (string-ascii 50))) (voting-period uint))
+  (let (
+    (amendment-id (+ (var-get amendment-counter) u1))
+    (caller tx-sender)
+    (proposal (unwrap! (map-get? proposals proposal-id) ERR_PROPOSAL_NOT_FOUND))
+    (start-block stacks-block-height)
+    (end-block (+ stacks-block-height voting-period))
+  )
+    (asserts! (is-registered caller) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq caller (get proposer proposal)) ERR_NOT_ORIGINAL_PROPOSER)
+    (asserts! (is-eq (get status proposal) "active") ERR_CANNOT_AMEND_FINALIZED_PROPOSAL)
+    (asserts! (<= stacks-block-height (get end-block proposal)) ERR_VOTING_ENDED)
+    (asserts! (and (>= voting-period MIN_VOTING_PERIOD) (<= voting-period MAX_VOTING_PERIOD)) ERR_INVALID_VOTING_PERIOD)
+    
+    (map-set proposal-amendments amendment-id {
+      proposal-id: proposal-id,
+      title: title,
+      description: description,
+      proposer: caller,
+      amendment-type: amendment-type,
+      new-title: new-title,
+      new-description: new-description,
+      new-category: new-category,
+      start-block: start-block,
+      end-block: end-block,
+      votes-for: u0,
+      votes-against: u0,
+      status: "active",
+      required-support: MIN_AMENDMENT_SUPPORT
+    })
+    
+    (var-set amendment-counter amendment-id)
+    (try! (add-amendment-to-history proposal-id amendment-id))
+    (ok amendment-id)
+  )
+)
+
+(define-public (vote-amendment (amendment-id uint) (vote-choice bool))
+  (let (
+    (caller tx-sender)
+    (amendment (unwrap! (map-get? proposal-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+    (voter-info (unwrap! (map-get? voter-registry caller) ERR_NOT_AUTHORIZED))
+    (voting-power (get voting-power voter-info))
+  )
+    (asserts! (get registered voter-info) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none (map-get? amendment-votes { amendment-id: amendment-id, voter: caller })) ERR_AMENDMENT_ALREADY_VOTED)
+    (asserts! (<= stacks-block-height (get end-block amendment)) ERR_AMENDMENT_VOTING_ENDED)
+    (asserts! (is-eq (get status amendment) "active") ERR_AMENDMENT_NOT_ACTIVE)
+    
+    (asserts! (map-set amendment-votes { amendment-id: amendment-id, voter: caller } {
+      vote: vote-choice,
+      voting-power: voting-power
+    }) ERR_AMENDMENT_NOT_FOUND)
+    
+    (begin
+      (if vote-choice
+        (map-set proposal-amendments amendment-id (merge amendment {
+          votes-for: (+ (get votes-for amendment) voting-power)
+        }))
+        (map-set proposal-amendments amendment-id (merge amendment {
+          votes-against: (+ (get votes-against amendment) voting-power)
+        }))
+      )
+    )
+    
+    (try! (update-voter-reputation caller))
+    (ok true)
+  )
+)
+
+(define-public (finalize-amendment (amendment-id uint))
+  (let (
+    (amendment (unwrap! (map-get? proposal-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+    (proposal (unwrap! (map-get? proposals (get proposal-id amendment)) ERR_PROPOSAL_NOT_FOUND))
+    (total-votes (+ (get votes-for amendment) (get votes-against amendment)))
+    (support-percentage (if (> total-votes u0)
+                          (/ (* (get votes-for amendment) u100) total-votes)
+                          u0))
+  )
+    (asserts! (> stacks-block-height (get end-block amendment)) ERR_AMENDMENT_VOTING_ENDED)
+    (asserts! (is-eq (get status amendment) "active") ERR_AMENDMENT_NOT_ACTIVE)
+    (asserts! (is-eq (get status proposal) "active") ERR_CANNOT_AMEND_FINALIZED_PROPOSAL)
+    
+    (let ((amendment-passed (and (>= total-votes (var-get min-quorum))
+                                (>= support-percentage (get required-support amendment)))))
+      (if amendment-passed
+        (begin
+          (map-set proposal-amendments amendment-id (merge amendment { status: "passed" }))
+          (try! (apply-amendment amendment-id))
+          (ok "passed")
+        )
+        (begin
+          (map-set proposal-amendments amendment-id (merge amendment { status: "rejected" }))
+          (ok "rejected")
+        )
+      )
+    )
+  )
+)
+
+(define-private (apply-amendment (amendment-id uint))
+  (let (
+    (amendment (unwrap! (map-get? proposal-amendments amendment-id) ERR_AMENDMENT_NOT_FOUND))
+    (proposal (unwrap! (map-get? proposals (get proposal-id amendment)) ERR_PROPOSAL_NOT_FOUND))
+    (new-title (default-to (get title proposal) (get new-title amendment)))
+    (new-description (default-to (get description proposal) (get new-description amendment)))
+    (new-category (default-to (get category proposal) (get new-category amendment)))
+  )
+    (map-set proposals (get proposal-id amendment) (merge proposal {
+      title: new-title,
+      description: new-description,
+      category: new-category
+    }))
+    (ok true)
+  )
+)
+
+(define-private (add-amendment-to-history (proposal-id uint) (amendment-id uint))
+  (let ((current-history (default-to (list) (map-get? proposal-amendment-history proposal-id))))
+    (map-set proposal-amendment-history proposal-id 
+      (unwrap! (as-max-len? (append current-history amendment-id) u10) ERR_AMENDMENT_NOT_FOUND))
+    (ok true)
   )
 )
 
@@ -452,3 +615,52 @@
     false
   )
 )
+
+(define-read-only (get-amendment (amendment-id uint))
+  (map-get? proposal-amendments amendment-id)
+)
+
+(define-read-only (get-amendment-vote (amendment-id uint) (voter principal))
+  (map-get? amendment-votes { amendment-id: amendment-id, voter: voter })
+)
+
+(define-read-only (get-amendment-count)
+  (var-get amendment-counter)
+)
+
+(define-read-only (get-amendment-results (amendment-id uint))
+  (match (map-get? proposal-amendments amendment-id)
+    amendment (some {
+      votes-for: (get votes-for amendment),
+      votes-against: (get votes-against amendment),
+      total-votes: (+ (get votes-for amendment) (get votes-against amendment)),
+      support-percentage: (if (> (+ (get votes-for amendment) (get votes-against amendment)) u0)
+                            (/ (* (get votes-for amendment) u100) 
+                               (+ (get votes-for amendment) (get votes-against amendment)))
+                            u0)
+    })
+    none
+  )
+)
+
+(define-read-only (is-amendment-voting-active (amendment-id uint))
+  (match (map-get? proposal-amendments amendment-id)
+    amendment (and (<= stacks-block-height (get end-block amendment))
+                   (is-eq (get status amendment) "active"))
+    false
+  )
+)
+
+(define-read-only (get-proposal-amendment-history (proposal-id uint))
+  (map-get? proposal-amendment-history proposal-id)
+)
+
+(define-read-only (get-amendment-status (amendment-id uint))
+  (match (map-get? proposal-amendments amendment-id)
+    amendment (some (get status amendment))
+    none
+  )
+)
+
+
+
